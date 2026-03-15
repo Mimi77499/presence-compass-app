@@ -1,0 +1,4 @@
+project_id = "tsslcxgemyoshlekjztv"
+
+[functions.analyze-communication]
+verify_jwt = false
