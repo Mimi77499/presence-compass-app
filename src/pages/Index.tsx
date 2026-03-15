@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Settings } from "lucide-react";
+import { Settings, Video } from "lucide-react";
+import { Link } from "react-router-dom";
 import PresenceCompass from "@/components/PresenceCompass";
 import SessionTimer from "@/components/SessionTimer";
 import DriftLog from "@/components/DriftLog";
