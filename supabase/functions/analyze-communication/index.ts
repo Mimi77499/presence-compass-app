@@ -12,12 +12,12 @@ serve(async (req) => {
   }
 
   try {
-    const { transcript, speechMetrics, durationSeconds } = await req.json();
+    const { transcript, speechMetrics, durationSeconds, promptContext } = await req.json();
 
     const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
     if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY is not configured");
 
-    const systemPrompt = `You are an expert communication coach. Analyze the following speech data and return a JSON object with communication metrics.
+    const systemPrompt = `You are an expert communication coach. Analyze the following speech data and return a JSON object with detailed communication metrics AND word-by-word analysis.
 
 Given the transcript and speech metrics, evaluate and return ONLY a valid JSON object (no markdown, no code blocks) with this exact structure:
 {
@@ -32,14 +32,31 @@ Given the transcript and speech metrics, evaluate and return ONLY a valid JSON o
   "pauseControl": { "longPauses": <number>, "feedback": "<1-2 sentence feedback>" },
   "posture": { "score": <number 0-100>, "feedback": "<1-2 sentence feedback>" },
   "overallScore": <number 0-100>,
-  "suggestions": ["<suggestion1>", "<suggestion2>", "<suggestion3>", "<suggestion4>"]
+  "suggestions": ["<suggestion1>", "<suggestion2>", "<suggestion3>", "<suggestion4>"],
+  "wordAnalysis": [
+    { "word": "<word>", "type": "<normal|filler|strong|weak|repetition>", "note": "<optional short note>" }
+  ],
+  "promptFeedback": "<If a guided prompt was given, 2-3 sentences evaluating how well the speaker addressed the prompt. null if no prompt.>"
 }
 
-Be realistic and helpful. Base your analysis on the actual transcript content and metrics provided.`;
+WORD ANALYSIS RULES:
+- Go through EVERY word in the transcript
+- Mark filler words (um, uh, like, you know, basically, actually, literally, so, well, right, I mean, kind of, sort of) as "filler"
+- Mark strong/confident words (clear verbs, specific nouns, impactful adjectives) as "strong"
+- Mark weak/vague words (thing, stuff, maybe, just, I think, I guess, whatever, probably) as "weak"
+- Mark words repeated excessively (3+ times in short span) as "repetition"
+- Mark everything else as "normal"
+- Add a short "note" for non-normal words explaining why it was flagged
+
+Be realistic, honest, and constructive. Base analysis on the actual transcript.`;
+
+    const promptInfo = promptContext
+      ? `\nGuided Prompt: "${promptContext.title}" — ${promptContext.description} (Time limit: ${promptContext.timeLimit}s)`
+      : "";
 
     const userPrompt = `Analyze this communication session:
 
-Duration: ${durationSeconds} seconds
+Duration: ${durationSeconds} seconds${promptInfo}
 Transcript: "${transcript || "(no speech detected)"}"
 
 Speech Metrics:
@@ -52,7 +69,7 @@ Speech Metrics:
 - Pause count (>2s): ${speechMetrics?.longPauses ?? 0}
 - Speaking time ratio: ${speechMetrics?.speakingRatio ?? "unknown"}
 
-Please provide a thorough and honest assessment.`;
+Please provide a thorough and honest assessment with word-by-word analysis.`;
 
     const response = await fetch(
       "https://ai.gateway.lovable.dev/v1/chat/completions",
@@ -93,10 +110,8 @@ Please provide a thorough and honest assessment.`;
     const aiResult = await response.json();
     const content = aiResult.choices?.[0]?.message?.content;
 
-    // Parse the JSON from the AI response
     let analysis;
     try {
-      // Try to extract JSON from the response (handle potential markdown wrapping)
       const jsonMatch = content.match(/\{[\s\S]*\}/);
       analysis = JSON.parse(jsonMatch ? jsonMatch[0] : content);
     } catch {
