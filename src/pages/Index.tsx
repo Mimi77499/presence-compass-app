@@ -180,9 +180,18 @@ const Index = () => {
           <DriftLog entries={entries} sessionStart={startTime} />
         )}
         {appState === "idle" && (
-          <p className="text-center text-[10px] text-muted-foreground/60 tracking-wider">
-            ATTENTION IS A COORDINATE. THIS IS YOUR MAP.
-          </p>
+          <div className="flex flex-col items-center gap-3">
+            <Link
+              to="/communicate"
+              className="flex items-center gap-2 text-xs text-primary hover:text-primary/80 transition-colors font-medium"
+            >
+              <Video className="w-3.5 h-3.5" />
+              Communication Lab
+            </Link>
+            <p className="text-center text-[10px] text-muted-foreground/60 tracking-wider">
+              ATTENTION IS A COORDINATE. THIS IS YOUR MAP.
+            </p>
+          </div>
         )}
       </footer>
 
