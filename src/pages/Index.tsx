@@ -157,7 +157,7 @@ const Index = () => {
           {/* Camera preview during active/calibrating */}
           {(isActive || isCalibrating) && (
             <AttentionCamera
-              ref={videoRef}
+              ref={videoRef as React.RefObject<HTMLVideoElement>}
               cameraReady={cameraReady}
               cameraError={cameraError}
               faceDetected={faceDetected}
