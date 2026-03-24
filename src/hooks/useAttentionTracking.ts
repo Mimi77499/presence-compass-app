@@ -8,6 +8,15 @@ interface FacePosition {
   size: number; // face size ratio (0-1) for distance estimation
 }
 
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const removeDeadzone = (value: number, deadzone: number) => {
+  const magnitude = Math.abs(value);
+  if (magnitude <= deadzone) return 0;
+
+  return Math.sign(value) * clamp((magnitude - deadzone) / (1 - deadzone), 0, 1);
+};
+
 /**
  * Real webcam-based attention tracking with high sensitivity.
  * Uses FaceDetector API (Chrome/Edge) with enhanced canvas fallback.
@@ -36,6 +45,9 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
   const calibrationFrames = useRef(0);
   const faceDetectorRef = useRef<any>(null);
   const prevFrameRef = useRef<ImageData | null>(null);
+  const motionEnergyRef = useRef(0);
+  const stableFramesRef = useRef(0);
+  const driftHoldRef = useRef(0);
 
   // Initialize FaceDetector if available (Chrome/Edge)
   useEffect(() => {
@@ -241,8 +253,8 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
         if (facePos.detected) {
           noFaceCountRef.current = 0;
 
-          // Calibration phase (first 15 frames ~1s)
-          if (calibrationFrames.current < 15) {
+           // Calibration phase (first 18 frames ~1s)
+           if (calibrationFrames.current < 18) {
             calibrationFrames.current++;
             if (!baselineRef.current) {
               baselineRef.current = { x: facePos.x, y: facePos.y, size: facePos.size };
@@ -254,31 +266,55 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
             lastFaceRef.current = facePos;
           } else {
             const baseline = baselineRef.current || { x: 0, y: 0, size: 0 };
-            const rawDriftX = facePos.x - baseline.x;
-            const rawDriftY = facePos.y - baseline.y;
 
-            // Amplify more aggressively — head movements are very subtle on webcam
-            const amplify = 4.5;
-            const clampedX = Math.max(-1, Math.min(1, rawDriftX * amplify));
-            const clampedY = Math.max(-1, Math.min(1, rawDriftY * amplify));
+             const movementX = Math.abs(facePos.x - lastFaceRef.current.x);
+             const movementY = Math.abs(facePos.y - lastFaceRef.current.y);
+             const movementSize = Math.abs(facePos.size - lastFaceRef.current.size);
+             const motionEnergy = movementX * 0.42 + movementY * 0.42 + movementSize * 2.4;
+             motionEnergyRef.current = motionEnergyRef.current * 0.82 + motionEnergy * 0.18;
 
-            // Also detect if user moved away from camera (face got smaller)
-            let distanceDrift = 0;
-            if (baseline.size > 0 && facePos.size > 0) {
-              const sizeRatio = facePos.size / baseline.size;
-              if (sizeRatio < 0.6) {
-                distanceDrift = 0.5; // leaning back significantly
-              }
-            }
+             const rawDriftX = facePos.x - baseline.x;
+             const rawDriftY = facePos.y - baseline.y;
+             const sizeDelta =
+               baseline.size > 0 && facePos.size > 0 ? (baseline.size - facePos.size) / baseline.size : 0;
 
-            driftRef.current = {
-              x: clampedX,
-              y: Math.max(-1, Math.min(1, clampedY + distanceDrift * 0.3)),
-            };
+             // Filter camera jitter, but still allow small intentional movement through.
+             const adaptiveDeadzone = clamp(0.03 + motionEnergyRef.current * 0.55, 0.03, 0.12);
+             const normalizedSensitivity = clamp((80 - cueSensitivity) / 70, 0, 1);
+             const horizontalGain = 3.8 + normalizedSensitivity * 2.2;
+             const verticalGain = 3.4 + normalizedSensitivity * 1.8;
+             const distanceGain = 1 + normalizedSensitivity * 0.5;
+
+             const driftXValue = clamp(removeDeadzone(rawDriftX, adaptiveDeadzone) * horizontalGain, -1, 1);
+             const driftYValue = clamp(removeDeadzone(rawDriftY, adaptiveDeadzone) * verticalGain, -1, 1);
+             const distanceDrift = sizeDelta > 0.08 ? clamp((sizeDelta - 0.08) * 2.4 * distanceGain, 0, 0.9) : 0;
+
+             const isNearBaseline =
+               Math.abs(rawDriftX) < adaptiveDeadzone * 1.2 &&
+               Math.abs(rawDriftY) < adaptiveDeadzone * 1.2 &&
+               Math.abs(sizeDelta) < 0.09;
+
+             if (!wasDriftingRef.current && isNearBaseline) {
+               stableFramesRef.current += 1;
+               const settleWeight = stableFramesRef.current > 10 ? 0.035 : 0.015;
+               baselineRef.current = {
+                 x: baseline.x * (1 - settleWeight) + facePos.x * settleWeight,
+                 y: baseline.y * (1 - settleWeight) + facePos.y * settleWeight,
+                 size: baseline.size * (1 - settleWeight) + facePos.size * settleWeight,
+               };
+             } else {
+               stableFramesRef.current = 0;
+             }
+
+             driftRef.current = {
+               x: driftXValue,
+               y: clamp(driftYValue + distanceDrift * 0.35, -1, 1),
+             };
           }
 
           lastFaceRef.current = facePos;
         } else {
+           stableFramesRef.current = 0;
           noFaceCountRef.current++;
 
           // React faster: after ~180ms of no face, register drift
@@ -316,10 +352,16 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
   // Detect drift threshold & log entries
   useEffect(() => {
     const magnitude = Math.sqrt(driftX * driftX + driftY * driftY);
-    // Lower threshold = more sensitive. Scale with cueSensitivity (0-100)
-    // At sensitivity 40: threshold ≈ 0.20 (very responsive)
-    const threshold = (cueSensitivity / 100) * 0.6;
-    const drifting = magnitude > threshold;
+    const relaxedRatio = clamp((cueSensitivity - 10) / 70, 0, 1);
+    const threshold = 0.09 + relaxedRatio * 0.27;
+
+    if (magnitude > threshold) {
+      driftHoldRef.current = Math.min(driftHoldRef.current + 1, 6);
+    } else {
+      driftHoldRef.current = Math.max(driftHoldRef.current - 2, 0);
+    }
+
+    const drifting = magnitude > threshold && (driftHoldRef.current >= 2 || magnitude > threshold * 1.45);
 
     if (drifting && !wasDriftingRef.current) {
       const absX = Math.abs(driftX);
@@ -386,6 +428,9 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
     calibrationFrames.current = 0;
     noFaceCountRef.current = 0;
     prevFrameRef.current = null;
+    motionEnergyRef.current = 0;
+    stableFramesRef.current = 0;
+    driftHoldRef.current = 0;
     setDriftX(0);
     setDriftY(0);
     setIsDrifting(false);
