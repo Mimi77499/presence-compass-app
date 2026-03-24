@@ -5,14 +5,13 @@ interface FacePosition {
   x: number; // -1 (left) to 1 (right)
   y: number; // -1 (up) to 1 (down)
   detected: boolean;
+  size: number; // face size ratio (0-1) for distance estimation
 }
 
-const DOMAINS = ["Future Planning", "Past Memory", "Internal Thought", "External Disturbance"];
-
 /**
- * Real webcam-based attention tracking.
- * Uses face detection to determine where the user is looking.
- * When face moves away from center or disappears → drift detected.
+ * Real webcam-based attention tracking with high sensitivity.
+ * Uses FaceDetector API (Chrome/Edge) with enhanced canvas fallback.
+ * Tracks: face position, face disappearance, head turn, distance changes.
  */
 export function useAttentionTracking(isActive: boolean, cueSensitivity: number) {
   const [driftX, setDriftX] = useState(0);
@@ -30,12 +29,13 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
   const animFrameRef = useRef<number>(0);
   const driftRef = useRef({ x: 0, y: 0 });
   const smoothDriftRef = useRef({ x: 0, y: 0 });
-  const lastFaceRef = useRef<FacePosition>({ x: 0, y: 0, detected: false });
+  const lastFaceRef = useRef<FacePosition>({ x: 0, y: 0, detected: false, size: 0 });
   const noFaceCountRef = useRef(0);
   const wasDriftingRef = useRef(false);
-  const baselineRef = useRef<{ x: number; y: number } | null>(null);
+  const baselineRef = useRef<{ x: number; y: number; size: number } | null>(null);
   const calibrationFrames = useRef(0);
   const faceDetectorRef = useRef<any>(null);
+  const prevFrameRef = useRef<ImageData | null>(null);
 
   // Initialize FaceDetector if available (Chrome/Edge)
   useEffect(() => {
@@ -51,12 +51,16 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
     }
   }, []);
 
-  // Start camera
   const startCamera = useCallback(async () => {
     try {
       setCameraError(null);
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 320 }, height: { ideal: 240 } },
+        video: {
+          facingMode: "user",
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+          frameRate: { ideal: 30 },
+        },
       });
       streamRef.current = stream;
 
@@ -71,7 +75,6 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
     }
   }, []);
 
-  // Stop camera
   const stopCamera = useCallback(() => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
@@ -83,80 +86,127 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
     setCameraReady(false);
   }, []);
 
-  // Detect face using FaceDetector API
+  // Native FaceDetector
   const detectFaceNative = useCallback(async (video: HTMLVideoElement): Promise<FacePosition> => {
-    if (!faceDetectorRef.current) return { x: 0, y: 0, detected: false };
-
+    if (!faceDetectorRef.current) return { x: 0, y: 0, detected: false, size: 0 };
     try {
       const faces = await faceDetectorRef.current.detect(video);
       if (faces.length > 0) {
         const face = faces[0].boundingBox;
         const centerX = face.x + face.width / 2;
         const centerY = face.y + face.height / 2;
-        // Normalize to -1..1 (inverted X because webcam is mirrored)
         const normX = -((centerX / video.videoWidth) * 2 - 1);
         const normY = (centerY / video.videoHeight) * 2 - 1;
-        return { x: normX, y: normY, detected: true };
+        const size = (face.width * face.height) / (video.videoWidth * video.videoHeight);
+        return { x: normX, y: normY, detected: true, size };
       }
     } catch {}
-    return { x: 0, y: 0, detected: false };
+    return { x: 0, y: 0, detected: false, size: 0 };
   }, []);
 
-  // Detect face using canvas brightness analysis (fallback)
+  // Enhanced canvas fallback: combines skin detection + motion detection + brightness center
   const detectFaceCanvas = useCallback(
     (video: HTMLVideoElement, canvas: HTMLCanvasElement): FacePosition => {
       const ctx = canvas.getContext("2d", { willReadFrequently: true });
-      if (!ctx) return { x: 0, y: 0, detected: false };
+      if (!ctx) return { x: 0, y: 0, detected: false, size: 0 };
 
-      canvas.width = 80;
-      canvas.height = 60;
-      ctx.drawImage(video, 0, 0, 80, 60);
-      const imageData = ctx.getImageData(0, 0, 80, 60);
+      const W = 160;
+      const H = 120;
+      canvas.width = W;
+      canvas.height = H;
+      ctx.drawImage(video, 0, 0, W, H);
+      const imageData = ctx.getImageData(0, 0, W, H);
       const data = imageData.data;
 
-      // Detect skin-tone pixels and compute weighted center
-      let totalWeight = 0;
-      let weightedX = 0;
-      let weightedY = 0;
-      let skinPixels = 0;
+      // --- Method 1: Skin-tone detection (broad range for all skin tones) ---
+      let skinWeightX = 0;
+      let skinWeightY = 0;
+      let skinTotal = 0;
+      let skinMinX = W, skinMaxX = 0, skinMinY = H, skinMaxY = 0;
 
-      for (let y = 0; y < 60; y++) {
-        for (let x = 0; x < 80; x++) {
-          const i = (y * 80 + x) * 4;
-          const r = data[i];
-          const g = data[i + 1];
-          const b = data[i + 2];
+      for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+          const i = (y * W + x) * 4;
+          const r = data[i], g = data[i + 1], b = data[i + 2];
 
-          // Simple skin-tone detection (works for various skin tones)
+          // YCbCr skin detection (more robust across skin tones)
+          const Y = 0.299 * r + 0.587 * g + 0.114 * b;
+          const Cb = 128 - 0.169 * r - 0.331 * g + 0.500 * b;
+          const Cr = 128 + 0.500 * r - 0.419 * g - 0.081 * b;
+
           const isSkin =
-            r > 60 && g > 40 && b > 20 &&
-            r > g && r > b &&
-            Math.abs(r - g) > 10 &&
-            r - b > 15;
+            Y > 50 &&
+            Cb > 77 && Cb < 127 &&
+            Cr > 133 && Cr < 173;
 
           if (isSkin) {
-            const weight = 1;
-            weightedX += x * weight;
-            weightedY += y * weight;
-            totalWeight += weight;
-            skinPixels++;
+            // Weight center pixels more (face is typically in center region)
+            const centerWeight = 1 + 0.5 * (1 - Math.abs(x / W - 0.5) * 2);
+            skinWeightX += x * centerWeight;
+            skinWeightY += y * centerWeight;
+            skinTotal += centerWeight;
+            if (x < skinMinX) skinMinX = x;
+            if (x > skinMaxX) skinMaxX = x;
+            if (y < skinMinY) skinMinY = y;
+            if (y > skinMaxY) skinMaxY = y;
           }
         }
       }
 
-      // Need minimum skin pixels to consider a face detected
-      if (skinPixels < 80) {
-        return { x: 0, y: 0, detected: false };
+      // --- Method 2: Frame differencing (motion detection) ---
+      let motionX = 0, motionY = 0, motionTotal = 0;
+      if (prevFrameRef.current && prevFrameRef.current.width === W) {
+        const prevData = prevFrameRef.current.data;
+        for (let y = 0; y < H; y += 2) {
+          for (let x = 0; x < W; x += 2) {
+            const i = (y * W + x) * 4;
+            const diff = Math.abs(data[i] - prevData[i]) +
+                         Math.abs(data[i + 1] - prevData[i + 1]) +
+                         Math.abs(data[i + 2] - prevData[i + 2]);
+            if (diff > 40) {
+              motionX += x;
+              motionY += y;
+              motionTotal++;
+            }
+          }
+        }
+      }
+      prevFrameRef.current = new ImageData(new Uint8ClampedArray(data), W, H);
+
+      // Combine signals
+      const skinPixelCount = skinTotal;
+      const hasSkin = skinPixelCount > 40;
+      const hasMotion = motionTotal > 20;
+
+      if (!hasSkin && !hasMotion) {
+        return { x: 0, y: 0, detected: false, size: 0 };
       }
 
-      const avgX = weightedX / totalWeight;
-      const avgY = weightedY / totalWeight;
+      let finalX: number, finalY: number;
 
-      // Normalize to -1..1 (inverted X for mirrored webcam)
-      const normX = -((avgX / 80) * 2 - 1);
-      const normY = (avgY / 60) * 2 - 1;
+      if (hasSkin) {
+        finalX = skinWeightX / skinTotal;
+        finalY = skinWeightY / skinTotal;
 
-      return { x: normX, y: normY, detected: true };
+        // Blend with motion if available
+        if (hasMotion) {
+          const mx = motionX / motionTotal;
+          const my = motionY / motionTotal;
+          finalX = finalX * 0.7 + mx * 0.3;
+          finalY = finalY * 0.7 + my * 0.3;
+        }
+      } else {
+        finalX = motionX / motionTotal;
+        finalY = motionY / motionTotal;
+      }
+
+      const normX = -((finalX / W) * 2 - 1);
+      const normY = (finalY / H) * 2 - 1;
+      const faceWidth = skinMaxX - skinMinX;
+      const faceHeight = skinMaxY - skinMinY;
+      const size = hasSkin ? (faceWidth * faceHeight) / (W * H) : 0;
+
+      return { x: normX, y: normY, detected: true, size };
     },
     []
   );
@@ -170,7 +220,7 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
     if (!canvasRef.current) canvasRef.current = canvas;
 
     let lastDetectTime = 0;
-    const DETECT_INTERVAL = 100; // ms between detections
+    const DETECT_INTERVAL = 60; // faster polling for responsiveness
 
     const trackLoop = async () => {
       const now = performance.now();
@@ -180,7 +230,6 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
 
         let facePos: FacePosition;
 
-        // Try native FaceDetector first, fall back to canvas
         if (faceDetectorRef.current) {
           facePos = await detectFaceNative(video);
         } else {
@@ -192,50 +241,60 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
         if (facePos.detected) {
           noFaceCountRef.current = 0;
 
-          // Calibration: establish baseline position (first 20 frames)
-          if (calibrationFrames.current < 20) {
+          // Calibration phase (first 15 frames ~1s)
+          if (calibrationFrames.current < 15) {
             calibrationFrames.current++;
             if (!baselineRef.current) {
-              baselineRef.current = { x: facePos.x, y: facePos.y };
+              baselineRef.current = { x: facePos.x, y: facePos.y, size: facePos.size };
             } else {
-              baselineRef.current.x = baselineRef.current.x * 0.9 + facePos.x * 0.1;
-              baselineRef.current.y = baselineRef.current.y * 0.9 + facePos.y * 0.1;
+              baselineRef.current.x = baselineRef.current.x * 0.85 + facePos.x * 0.15;
+              baselineRef.current.y = baselineRef.current.y * 0.85 + facePos.y * 0.15;
+              baselineRef.current.size = baselineRef.current.size * 0.85 + facePos.size * 0.15;
             }
             lastFaceRef.current = facePos;
           } else {
-            // Calculate drift from baseline
-            const baseline = baselineRef.current || { x: 0, y: 0 };
+            const baseline = baselineRef.current || { x: 0, y: 0, size: 0 };
             const rawDriftX = facePos.x - baseline.x;
             const rawDriftY = facePos.y - baseline.y;
 
-            // Amplify drift for sensitivity (head movements are subtle)
-            const amplify = 2.5;
+            // Amplify more aggressively — head movements are very subtle on webcam
+            const amplify = 4.5;
             const clampedX = Math.max(-1, Math.min(1, rawDriftX * amplify));
             const clampedY = Math.max(-1, Math.min(1, rawDriftY * amplify));
 
-            driftRef.current = { x: clampedX, y: clampedY };
+            // Also detect if user moved away from camera (face got smaller)
+            let distanceDrift = 0;
+            if (baseline.size > 0 && facePos.size > 0) {
+              const sizeRatio = facePos.size / baseline.size;
+              if (sizeRatio < 0.6) {
+                distanceDrift = 0.5; // leaning back significantly
+              }
+            }
+
+            driftRef.current = {
+              x: clampedX,
+              y: Math.max(-1, Math.min(1, clampedY + distanceDrift * 0.3)),
+            };
           }
 
           lastFaceRef.current = facePos;
         } else {
-          // Face not detected — significant drift
           noFaceCountRef.current++;
 
-          if (noFaceCountRef.current > 5) {
-            // After ~500ms of no face, register strong drift
-            // Use last known direction, amplified
+          // React faster: after ~180ms of no face, register drift
+          if (noFaceCountRef.current > 3) {
             const lastDir = lastFaceRef.current;
             const angle = Math.atan2(lastDir.y, lastDir.x) || Math.random() * Math.PI * 2;
             driftRef.current = {
-              x: Math.cos(angle) * 0.8,
-              y: Math.sin(angle) * 0.8,
+              x: Math.cos(angle) * 0.9,
+              y: Math.sin(angle) * 0.9,
             };
           }
         }
       }
 
-      // Smooth the drift values
-      const smoothing = 0.08;
+      // Faster smoothing for more responsive feel
+      const smoothing = 0.18;
       smoothDriftRef.current = {
         x: smoothDriftRef.current.x + (driftRef.current.x - smoothDriftRef.current.x) * smoothing,
         y: smoothDriftRef.current.y + (driftRef.current.y - smoothDriftRef.current.y) * smoothing,
@@ -257,7 +316,9 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
   // Detect drift threshold & log entries
   useEffect(() => {
     const magnitude = Math.sqrt(driftX * driftX + driftY * driftY);
-    const threshold = cueSensitivity / 100;
+    // Lower threshold = more sensitive. Scale with cueSensitivity (0-100)
+    // At sensitivity 40: threshold ≈ 0.20 (very responsive)
+    const threshold = (cueSensitivity / 100) * 0.6;
     const drifting = magnitude > threshold;
 
     if (drifting && !wasDriftingRef.current) {
@@ -270,7 +331,6 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
         domain = driftX < 0 ? "Internal Thought" : "External Disturbance";
       }
 
-      // If face not detected, mark as external
       if (!faceDetected) {
         domain = "External Disturbance";
       }
@@ -297,9 +357,12 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
   }, [driftX, driftY, cueSensitivity, faceDetected]);
 
   const returnToNow = useCallback(() => {
-    // Re-calibrate baseline to current position
     if (lastFaceRef.current.detected) {
-      baselineRef.current = { x: lastFaceRef.current.x, y: lastFaceRef.current.y };
+      baselineRef.current = {
+        x: lastFaceRef.current.x,
+        y: lastFaceRef.current.y,
+        size: lastFaceRef.current.size,
+      };
     }
     driftRef.current = { x: 0, y: 0 };
     smoothDriftRef.current = { x: 0, y: 0 };
@@ -322,6 +385,7 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
     baselineRef.current = null;
     calibrationFrames.current = 0;
     noFaceCountRef.current = 0;
+    prevFrameRef.current = null;
     setDriftX(0);
     setDriftY(0);
     setIsDrifting(false);
@@ -331,18 +395,8 @@ export function useAttentionTracking(isActive: boolean, cueSensitivity: number) 
   }, []);
 
   return {
-    driftX,
-    driftY,
-    isDrifting,
-    currentDomain,
-    entries,
-    returnToNow,
-    reset,
-    startCamera,
-    stopCamera,
-    cameraReady,
-    cameraError,
-    faceDetected,
-    videoRef,
+    driftX, driftY, isDrifting, currentDomain, entries,
+    returnToNow, reset, startCamera, stopCamera,
+    cameraReady, cameraError, faceDetected, videoRef,
   };
 }
