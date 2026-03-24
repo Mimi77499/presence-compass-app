@@ -54,12 +54,13 @@ const Index = () => {
 
   const isActive = appState === "active";
   const isCalibrating = appState === "calibrating";
+  const isTracking = isActive || isCalibrating;
 
   const {
     driftX, driftY, isDrifting, currentDomain, entries,
     returnToNow, reset, startCamera, stopCamera,
     cameraReady, cameraError, faceDetected, videoRef,
-  } = useAttentionTracking(isActive, cueSensitivity);
+  } = useAttentionTracking(isTracking, cueSensitivity);
 
   const { playCue } = useAudioCues(soundEnabled, brownNoiseEnabled);
   const prevDriftingRef = useRef(false);
